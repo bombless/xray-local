@@ -1,5 +1,8 @@
 package com.example.xraylocal
 
+import android.app.Activity
+import android.content.Intent
+import android.net.VpnService
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -21,45 +24,17 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
-import libv2ray.CoreCallbackHandler
-import libv2ray.CoreController
-import libv2ray.Libv2ray
-import org.json.JSONArray
-import org.json.JSONObject
 import java.net.HttpURLConnection
-import java.net.InetSocketAddress
-import java.net.Proxy
 import java.net.URL
 import java.util.concurrent.TimeUnit
 
 class MainActivity : ComponentActivity() {
-    private var controller: CoreController? = null
-    @Volatile private var coreStarted = false
-
-    private val callback = object : CoreCallbackHandler {
-        override fun startup(): Long {
-            coreStarted = true
-            return 0L
-        }
-
-        override fun shutdown(): Long {
-            coreStarted = false
-            return 0L
-        }
-
-        override fun onEmitStatus(code: Long, message: String): Long {
-            android.util.Log.d("XrayLocal", "[$code] $message")
-            return 0L
-        }
-    }
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        startXray()
 
         setContent {
             var html by remember { mutableStateOf("") }
-            var status by remember { mutableStateOf("Xray 正在启动…") }
+            var status by remember { mutableStateOf("点击按钮后建立无端口 TUN 隧道") }
             var loading by remember { mutableStateOf(false) }
 
             MaterialTheme {
@@ -73,26 +48,18 @@ class MainActivity : ComponentActivity() {
                             enabled = !loading,
                             onClick = {
                                 loading = true
-                                status = "正在通过 Xray 隧道访问 Google…"
-                                Thread {
-                                    try {
-                                        val body = fetchGoogle()
-                                        runOnUiThread {
-                                            html = body
-                                            status = "访问完成，返回 ${body.length} 个字符"
-                                            loading = false
-                                        }
-                                    } catch (t: Throwable) {
-                                        runOnUiThread {
-                                            html = "${t::class.java.simpleName}: ${t.message ?: "unknown error"}"
-                                            status = "访问失败"
-                                            loading = false
-                                        }
+                                html = ""
+                                status = "正在建立 Xray TUN 隧道…"
+                                requestVpnPermissionAndRun { result, message ->
+                                    runOnUiThread {
+                                        html = result
+                                        status = message
+                                        loading = false
                                     }
-                                }.start()
+                                }
                             }
                         ) {
-                            Text("访问google")
+                            Text("访问 google")
                         }
 
                         Text(status, style = MaterialTheme.typography.bodyMedium)
@@ -109,44 +76,58 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startXray() {
-        try {
-            Libv2ray.initCoreEnv(filesDir.absolutePath, "")
-            controller = Libv2ray.newCoreController(callback)
-
-            val root = JSONObject(assets.open("config.json").bufferedReader().use { it.readText() })
-            val inbounds = root.optJSONArray("inbounds") ?: JSONArray().also { root.put("inbounds", it) }
-            inbounds.put(
-                JSONObject()
-                    .put("listen", "127.0.0.1")
-                    .put("port", SOCKS_PORT)
-                    .put("protocol", "socks")
-                    .put("settings", JSONObject().put("auth", "noauth").put("udp", false))
-            )
-
-            // Keep the supplied outbound/routing configuration intact, but make log paths
-            // writable inside the app sandbox.
-            val log = root.optJSONObject("log") ?: JSONObject().also { root.put("log", it) }
-            log.put("loglevel", log.optString("loglevel", "warning"))
-            log.put("access", java.io.File(filesDir, "access.log").absolutePath)
-            log.put("error", java.io.File(filesDir, "error.log").absolutePath)
-
-            controller!!.startLoop(root.toString(), 0)
-            statusLog("Xray started without TUN; app-local SOCKS is 127.0.0.1:$SOCKS_PORT")
-        } catch (t: Throwable) {
-            android.util.Log.e("XrayLocal", "Failed to start Xray", t)
+    private fun requestVpnPermissionAndRun(onComplete: (String, String) -> Unit) {
+        val prepareIntent = VpnService.prepare(this)
+        if (prepareIntent != null) {
+            pendingCallback = onComplete
+            startActivityForResult(prepareIntent, REQUEST_VPN)
+        } else {
+            startVpnAndFetch(onComplete)
         }
     }
 
-    private fun fetchGoogle(): String {
-        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
-        while (!coreStarted && System.nanoTime() < deadline) {
-            Thread.sleep(100)
-        }
-        if (!coreStarted) error("Xray core did not start")
+    @Deprecated("Use Activity Result APIs in new code")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != REQUEST_VPN) return
 
-        val proxy = Proxy(Proxy.Type.SOCKS, InetSocketAddress("127.0.0.1", SOCKS_PORT))
-        val connection = (URL("https://www.google.com/").openConnection(proxy) as HttpURLConnection)
+        val callback = pendingCallback
+        pendingCallback = null
+        if (resultCode == Activity.RESULT_OK && callback != null) {
+            startVpnAndFetch(callback)
+        } else {
+            callback?.invoke("", "未授予 VPN 权限")
+        }
+    }
+
+    private fun startVpnAndFetch(onComplete: (String, String) -> Unit) {
+        XrayVpnService.start(this)
+
+        Thread {
+            try {
+                val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15)
+                while (!XrayVpnService.isRunning && System.nanoTime() < deadline) {
+                    Thread.sleep(100)
+                }
+                if (!XrayVpnService.isRunning) {
+                    error("Xray VPN service did not start")
+                }
+
+                val body = fetchGoogleDirect()
+                onComplete(body, "访问完成，返回 ${body.length} 个字符；请求未经过任何本地 SOCKS/HTTP 端口")
+            } catch (t: Throwable) {
+                onComplete(
+                    "${t::class.java.simpleName}: ${t.message ?: "unknown error"}",
+                    "访问失败"
+                )
+            } finally {
+                XrayVpnService.stop(this)
+            }
+        }.start()
+    }
+
+    private fun fetchGoogleDirect(): String {
+        val connection = URL("https://www.google.com/").openConnection() as HttpURLConnection
         connection.connectTimeout = 15_000
         connection.readTimeout = 30_000
         connection.instanceFollowRedirects = true
@@ -158,18 +139,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun statusLog(message: String) {
-        android.util.Log.i("XrayLocal", message)
-    }
-
-    override fun onDestroy() {
-        controller?.stopLoop()
-        controller = null
-        coreStarted = false
-        super.onDestroy()
-    }
-
     companion object {
-        private const val SOCKS_PORT = 10808
+        private const val REQUEST_VPN = 1001
+        private var pendingCallback: ((String, String) -> Unit)? = null
     }
 }
